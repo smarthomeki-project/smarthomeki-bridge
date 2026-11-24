@@ -3,6 +3,7 @@ from datetime import datetime, timedelta, date
 from zoneinfo import ZoneInfo
 import math
 
+DOMAIN = "smarthomeki_bridge"
 CAL = 'calendar.smarthomeki_events'
 DEFAULTS = dict(import_price=.30, export_price=.08, monthly_fixed=0, weekly=True, monthly=True, report_time='18:00')
 ENERGY = {k:'sensor.smarthomeki_total_'+v for k,v in {'import':'energy_import','export':'energy_export','load':'load_consumption','pv':'production','charge':'battery_charge','discharge':'battery_discharge'}.items()}
@@ -48,15 +49,15 @@ async def statistics(hass,ids,s,e,period):
 
 async def events(hass,s,e):
     if not hass.services.has_service('calendar','get_events'): raise ValueError('Calendar service unavailable')
-    r=await hass.services.async_call('calendar','get_events',{'entity_id':CAL,'start_date_time':s.isoformat(),'end_date_time':e.isoformat()},blocking=True,return_response=True)
-    return r.get(CAL,{}).get('events',[])
+    r=await hass.services.async_call('calendar','get_events',{'entity_id':hass.data[DOMAIN]['calendar'],'start_date_time':s.isoformat(),'end_date_time':e.isoformat()},blocking=True,return_response=True)
+    return r.get(hass.data[DOMAIN]['calendar'],{}).get('events',[])
 
 async def validate(hass,kind,a):
     if kind=='calendar_event':
         s,e=interval(hass,a,366)
         if not isinstance(a['summary'],str) or not 0<len(a['summary'])<=200: raise ValueError('Invalid summary')
         if (len(a['start'])==10)!=(len(a['end'])==10): raise ValueError('Mixed date types')
-        st=hass.states.get(CAL)
+        st=hass.states.get(hass.data[DOMAIN]['calendar'])
         if st is None or st.state=='unavailable' or not hass.services.has_service('calendar','create_event'): raise ValueError('Family calendar unavailable')
         for event in await events(hass,s,e):
             if event.get('summary')==a['summary']: raise ValueError('Possible duplicate event; inspect calendar')
@@ -83,7 +84,7 @@ async def apply(hass,state,p):
     if kind=='settings':
         await state['settings_store'].async_save(a); state['settings']=a.copy()
     elif kind=='calendar_event':
-        data={'entity_id':CAL,'summary':a['summary']}
+        data={'entity_id':hass.data[DOMAIN]['calendar'],'summary':a['summary']}
         for k in ('start','end'): data[k+('_date' if len(a[k])==10 else '_date_time')]=a[k] if len(a[k])==10 else dt(hass,a[k]).isoformat()
         await hass.services.async_call('calendar','create_event',data,blocking=True)
     else:
@@ -116,10 +117,11 @@ async def energy(hass, state, s, e):
         (s + timedelta(days=offset)).timestamp()
         for offset in range((e.date() - s.date()).days + 1)
     ]
-    rows = await statistics(hass, list(ENERGY.values()), s - timedelta(days=1), e, "day")
+    entities = state.get("energy_sensors", ENERGY)
+    rows = await statistics(hass, list(entities.values()), s - timedelta(days=1), e, "day")
     totals = {
         key: _daily_total(rows.get(entity, []), boundaries)
-        for key, entity in ENERGY.items()
+        for key, entity in entities.items()
     }
     settings=state['settings']; imp=totals['import']; exp=totals['export']
     return {'kwh':totals,'import_cost':None if imp is None else round(imp*settings['import_price'],2),'export_revenue':None if exp is None else round(exp*settings['export_price'],2),'note':'Daily recorder sum differences; missing buckets return null. Fixed costs excluded; tariff is current, not historical.'}

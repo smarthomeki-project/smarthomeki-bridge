@@ -62,8 +62,8 @@ def valid_card(card):
             and bool(card["type"]) and len(json.dumps(card, ensure_ascii=False).encode()) <= MAX_CARD_BYTES)
 
 
-def validate_args(args):
-    if not isinstance(args, dict) or set(args) != {"dashboard", "view_path", "card"} or args.get("dashboard") != DASHBOARD:
+def validate_args(args, dashboard_id):
+    if not isinstance(args, dict) or set(args) != {"dashboard", "view_path", "card"} or args.get("dashboard") != dashboard_id:
         return "Only smarthomeki with dashboard, view_path, card is allowed"
     if not isinstance(args.get("view_path"), str) or not 0 < len(args["view_path"]) <= 100:
         return "Invalid view_path"
@@ -89,10 +89,10 @@ def find_exact_card(config, path, old_card):
     return matches[0]
 
 
-def validate_edit_args(args):
+def validate_edit_args(args, dashboard_id, calendar_views):
     if not isinstance(args, dict) or set(args) != {"dashboard", "view_path", "old_card", "new_card"}:
         return "Expected dashboard, view_path, old_card, new_card"
-    if args["dashboard"] != DASHBOARD or args["view_path"] not in ("home", "calendar", "tablet"):
+    if args["dashboard"] != dashboard_id or args["view_path"] not in calendar_views:
         return "Only SmartHomeKI Home, Calendar or Tablet calendar cards may be edited"
     old, new = args["old_card"], args["new_card"]
     if not valid_card(old) or not valid_card(new):
@@ -147,7 +147,7 @@ def validate_edit_args(args):
         "showEventDate": True, "sortBy": "start",
         "grid_options": {"columns": 24},
     }
-    if args["view_path"] != "home" or old != expected_old or new != expected_new:
+    if args["view_path"] != calendar_views[0] or old != expected_old or new != expected_new:
         return "Custom card migration only allows the approved Home 7-day calendar configuration"
     return None
 
@@ -191,10 +191,10 @@ def get_diagnostics(hass, args):
             "truncated": len(unavailable) > MAX_RESULTS}
 
 
-def validate_card_change(args):
+def validate_card_change(args, dashboard_id):
     if not isinstance(args, dict) or set(args) != {"dashboard", "view_path", "operation", "old_card", "new_card"}:
         return "Expected dashboard, view_path, operation, old_card, new_card"
-    if args["dashboard"] != DASHBOARD or not isinstance(args["view_path"], str) or len(args["view_path"]) > 100:
+    if args["dashboard"] != dashboard_id or not isinstance(args["view_path"], str) or len(args["view_path"]) > 100:
         return "Invalid dashboard or view"
     if args["operation"] not in ("edit", "remove") or not valid_card(args["old_card"]):
         return "Invalid operation or original card"
@@ -225,7 +225,7 @@ def stage(state, hass, proposal):
     # Caller must hold state lock. No device or dashboard action occurs here.
     if state["pending"] is not None and time.monotonic() <= state["pending"]["expires"]:
         raise ValueError("Another proposal is awaiting approval")
-    if hass.states.get(BUTTON) is None:
+    if hass.states.get(state["approval_button"]) is None:
         raise ValueError("Approval button helper not found")
     pid = secrets.token_hex(8)
     state["pending"] = {"id": pid, "expires": time.monotonic() + TTL, **proposal}
@@ -233,11 +233,11 @@ def stage(state, hass, proposal):
     return pid
 
 
-def validate_view_args(args):
+def validate_view_args(args, dashboard_id):
     """Allow layout/content replacement only for an existing SmartHomeKI tab."""
     if not isinstance(args, dict) or set(args) != {"dashboard", "view_path", "view"}:
         return "Expected dashboard, view_path, view"
-    if args["dashboard"] != DASHBOARD or not isinstance(args["view_path"], str) or not 0 < len(args["view_path"]) <= 100:
+    if args["dashboard"] != dashboard_id or not isinstance(args["view_path"], str) or not 0 < len(args["view_path"]) <= 100:
         return "Invalid SmartHomeKI dashboard or view path"
     view = args["view"]
     if not isinstance(view, dict) or view.get("type") not in ("sections", "masonry"):
@@ -285,14 +285,15 @@ async def get_config(hass):
 
     # HA indexes dashboards by their URL path, not the storage filename.
     # Never select the default/production dashboard as a fallback.
-    dashboard = lovelace.dashboards.get("smarthome-ki")
+    path = hass.data[DOMAIN]["dashboard_path"]
+    dashboard = lovelace.dashboards.get(path)
     if dashboard is None:
         for candidate in lovelace.dashboards.values():
-            if getattr(candidate, "url_path", None) == "smarthome-ki":
+            if getattr(candidate, "url_path", None) == path:
                 dashboard = candidate
                 break
     if dashboard is None or dashboard.mode != MODE_STORAGE:
-        raise ValueError("SmartHomeKI storage dashboard not found (URL path smarthome-ki)")
+        raise ValueError("Configured SmartHomeKI storage dashboard not found")
 
     config = await dashboard.async_load(False)
     if not isinstance(config, dict) or not isinstance(config.get("views"), list):
@@ -309,6 +310,31 @@ def find_view(config, path):
 
 async def async_setup(hass, config):
     state = {"pending": None, "results": {}, "lock": asyncio.Lock()}
+    options = config.get(DOMAIN) or {}
+    if not isinstance(options, dict):
+        raise ValueError("SmartHomeKI configuration must be a mapping")
+    state["dashboard_path"] = options.get("dashboard_path", "smarthome-ki")
+    state["dashboard_id"] = options.get("dashboard_id", DASHBOARD)
+    state["approval_button"] = options.get("approval_button", BUTTON)
+    state["calendar"] = options.get("calendar", ext.CAL)
+    state["calendar_views"] = options.get("calendar_views", ["home", "calendar", "tablet"])
+    entities = options.get("energy_sensors", {})
+    if (
+        not isinstance(entities, dict)
+        or entities.keys() - ext.ENERGY.keys()
+        or any(not isinstance(value, str) or not value.startswith("sensor.") for value in entities.values())
+    ):
+        raise ValueError("Invalid SmartHomeKI energy_sensors mapping")
+    if (
+        any(not isinstance(state[key], str) or not state[key] for key in ("dashboard_path", "dashboard_id", "approval_button", "calendar"))
+        or not state["approval_button"].startswith("input_button.")
+        or not state["calendar"].startswith("calendar.")
+        or not isinstance(state["calendar_views"], list)
+        or len(state["calendar_views"]) != 3
+        or any(not isinstance(view, str) or not view for view in state["calendar_views"])
+    ):
+        raise ValueError("Invalid SmartHomeKI dashboard or entity configuration")
+    state["energy_sensors"] = ext.ENERGY | entities
     state["settings_store"] = Store(hass, 1, "smarthomeki_bridge.settings", private=True)
     state["settings"] = await state["settings_store"].async_load() or ext.DEFAULTS.copy()
     hass.data[DOMAIN] = state
@@ -317,7 +343,7 @@ async def async_setup(hass, config):
 
     @callback
     def on_button(event):
-        if event.data.get("entity_id") != BUTTON:
+        if event.data.get("entity_id") != state["approval_button"]:
             return
         old = event.data.get("old_state")
         new = event.data.get("new_state")
@@ -411,7 +437,7 @@ async def apply_dashboard_approved(hass, state, proposal, pid):
                 raise ValueError("Unknown proposal type")
             # Separate durable backup; if backup fails, never save.
             backup = Store(hass, 1, "smarthomeki_bridge.backup_" + pid, private=True)
-            await backup.async_save({"dashboard": DASHBOARD, "created_at": datetime.now(timezone.utc).isoformat(), "config": current})
+            await backup.async_save({"dashboard": state["dashboard_id"], "created_at": datetime.now(timezone.utc).isoformat(), "config": current})
             await dashboard.async_save(new_config)  # HA Lovelace API: updates cache and fires lovelace_updated.
             _, verified = await get_config(hass)
             if digest(verified) != digest(new_config):
@@ -427,8 +453,9 @@ class DashboardView(HomeAssistantView):
 
     async def get(self, request):
         try:
-            _, config = await get_config(request.app["hass"])
-            return self.json({"dashboard": DASHBOARD, "config": config})
+            hass = request.app["hass"]
+            _, config = await get_config(hass)
+            return self.json({"dashboard": hass.data[DOMAIN]["dashboard_id"], "config": config})
         except ValueError as exc:
             return self.json_message(str(exc), status_code=404)
 
@@ -459,16 +486,18 @@ class MCPView(HomeAssistantView):
             return self.error(rid, -32602, "Invalid params")
         hass = request.app["hass"]
         state = hass.data[DOMAIN]
+        dashboard_id = state["dashboard_id"]
+        approval_button = state["approval_button"]
         if method == "initialize":
-            result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "smarthomeki-bridge", "version": "2.1.0"}}
+            result = {"protocolVersion": "2025-03-26", "capabilities": {"tools": {"listChanged": False}}, "serverInfo": {"name": "smarthomeki-bridge", "version": "2.1.1"}}
         elif method == "ping":
             result = {}
         elif method == "tools/list":
-            args = {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [DASHBOARD]}, "view_path": {"type": "string"}, "card": {"type": "object"}}, "required": ["dashboard", "view_path", "card"], "additionalProperties": False}
-            view_args = {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [DASHBOARD]}, "view_path": {"type": "string"}, "view": {"type": "object"}}, "required": ["dashboard", "view_path", "view"], "additionalProperties": False}
+            args = {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [dashboard_id]}, "view_path": {"type": "string"}, "card": {"type": "object"}}, "required": ["dashboard", "view_path", "card"], "additionalProperties": False}
+            view_args = {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [dashboard_id]}, "view_path": {"type": "string"}, "view": {"type": "object"}}, "required": ["dashboard", "view_path", "view"], "additionalProperties": False}
             edit_args = {"type": "object", "properties": {
-                "dashboard": {"type": "string", "enum": [DASHBOARD]},
-                "view_path": {"type": "string", "enum": ["home", "calendar", "tablet"]},
+                "dashboard": {"type": "string", "enum": [dashboard_id]},
+                "view_path": {"type": "string", "enum": list(state["calendar_views"])},
                 "old_card": {"type": "object"}, "new_card": {"type": "object"}},
                 "required": ["dashboard", "view_path", "old_card", "new_card"], "additionalProperties": False}
             result = {"tools": [
@@ -485,9 +514,9 @@ class MCPView(HomeAssistantView):
                 {"name": DIAGNOSTICS, "description": "Read-only count of device domains and unavailable/unknown entities.",
                  "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}, "annotations": {"readOnlyHint": True}},
                 {"name": CARD_CHANGE_PREVIEW, "description": "Validate exact edit or removal of one SmartHomeKI card; no save.",
-                 "inputSchema": {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [DASHBOARD]}, "view_path": {"type": "string"}, "operation": {"type": "string", "enum": ["edit", "remove"]}, "old_card": {"type": "object"}, "new_card": {"type": ["object", "null"]}}, "required": ["dashboard", "view_path", "operation", "old_card", "new_card"], "additionalProperties": False}, "annotations": {"readOnlyHint": True}},
+                 "inputSchema": {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [dashboard_id]}, "view_path": {"type": "string"}, "operation": {"type": "string", "enum": ["edit", "remove"]}, "old_card": {"type": "object"}, "new_card": {"type": ["object", "null"]}}, "required": ["dashboard", "view_path", "operation", "old_card", "new_card"], "additionalProperties": False}, "annotations": {"readOnlyHint": True}},
                 {"name": CARD_CHANGE_PROPOSE, "description": "Stage one exact SmartHomeKI card edit/removal. Requires explicit chat permission BEFORE staging and separate Home Assistant button approval within 120 seconds. Backs up dashboard.",
-                 "inputSchema": {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [DASHBOARD]}, "view_path": {"type": "string"}, "operation": {"type": "string", "enum": ["edit", "remove"]}, "old_card": {"type": "object"}, "new_card": {"type": ["object", "null"]}}, "required": ["dashboard", "view_path", "operation", "old_card", "new_card"], "additionalProperties": False}, "annotations": {"readOnlyHint": False, "destructiveHint": True}},
+                 "inputSchema": {"type": "object", "properties": {"dashboard": {"type": "string", "enum": [dashboard_id]}, "view_path": {"type": "string"}, "operation": {"type": "string", "enum": ["edit", "remove"]}, "old_card": {"type": "object"}, "new_card": {"type": ["object", "null"]}}, "required": ["dashboard", "view_path", "operation", "old_card", "new_card"], "additionalProperties": False}, "annotations": {"readOnlyHint": False, "destructiveHint": True}},
                 {"name": ACTION_PREVIEW, "description": "Read-only validation of a safe on/off action; never executes.",
                  "inputSchema": {"type": "object", "properties": {"entity_id": {"type": "string"}, "service": {"type": "string", "enum": ["turn_on", "turn_off"]}}, "required": ["entity_id", "service"], "additionalProperties": False}, "annotations": {"readOnlyHint": True}},
                 {"name": ACTION_PROPOSE, "description": "Stage on/off for light, switch, input_boolean or automation ONLY. Requires explicit chat approval BEFORE staging and Home Assistant approval button within 120 seconds. No locks, covers, climate, alarm or scripts.",
@@ -506,7 +535,7 @@ class MCPView(HomeAssistantView):
             elif name == READ:
                 try:
                     _, config = await get_config(hass)
-                    result = content({"dashboard": DASHBOARD, "config": config})
+                    result = content({"dashboard": dashboard_id, "config": config})
                 except ValueError as exc:
                     result = content(str(exc), True)
             elif name == ENTITIES:
@@ -520,7 +549,7 @@ class MCPView(HomeAssistantView):
                 except ValueError as exc:
                     result = content(str(exc), True)
             elif name in (CARD_CHANGE_PREVIEW, CARD_CHANGE_PROPOSE):
-                err = validate_card_change(args)
+                err = validate_card_change(args, dashboard_id)
                 if err:
                     result = content(err, True)
                 else:
@@ -536,9 +565,9 @@ class MCPView(HomeAssistantView):
                                     "new_card": copy.deepcopy(args["new_card"]), "base_hash": digest(config)})
                             await hass.services.async_call("persistent_notification", "create", {
                                 "title": "SmartHomeKI – Kartenänderung freigeben",
-                                "message": f"{args['operation']} auf {args['view_path']}: Vorschlag {pid}. Nur bei Zustimmung innerhalb von 120 Sekunden {BUTTON} drücken."}, blocking=False)
+                                "message": f"{args['operation']} auf {args['view_path']}: Vorschlag {pid}. Nur bei Zustimmung innerhalb von 120 Sekunden {approval_button} drücken."}, blocking=False)
                             result = content({"proposal_id": pid, "status": "pending", "saved": False,
-                                "expires_in_seconds": TTL, "approval_button": BUTTON})
+                                "expires_in_seconds": TTL, "approval_button": approval_button})
                     except (ValueError, TypeError) as exc:
                         result = content(str(exc), True)
             elif name in (ACTION_PREVIEW, ACTION_PROPOSE):
@@ -553,13 +582,13 @@ class MCPView(HomeAssistantView):
                             pid = stage(state, hass, {"kind": "safe_action", **args})
                         await hass.services.async_call("persistent_notification", "create", {
                             "title": "SmartHomeKI – Geräteaktion freigeben",
-                            "message": f"{args['entity_id']}: {args['service']} (Vorschlag {pid}). Nur bei Zustimmung innerhalb von 120 Sekunden {BUTTON} drücken."}, blocking=False)
+                            "message": f"{args['entity_id']}: {args['service']} (Vorschlag {pid}). Nur bei Zustimmung innerhalb von 120 Sekunden {approval_button} drücken."}, blocking=False)
                         result = content({"proposal_id": pid, "status": "pending", "saved": False,
-                            "expires_in_seconds": TTL, "approval_button": BUTTON, **args})
+                            "expires_in_seconds": TTL, "approval_button": approval_button, **args})
                     except ValueError as exc:
                         result = content(str(exc), True)
             elif name in (PREVIEW, PROPOSE):
-                err = validate_args(args)
+                err = validate_args(args, dashboard_id)
                 if err:
                     result = content(err, True)
                 else:
@@ -571,22 +600,22 @@ class MCPView(HomeAssistantView):
                         if not isinstance(view.get("cards"), list) and not any(isinstance(s, dict) and isinstance(s.get("cards"), list) for s in view.get("sections", []) if isinstance(view.get("sections"), list)):
                             raise ValueError("View has no supported card container")
                         if name == PREVIEW:
-                            result = content({"valid": True, "saved": False, "dashboard": DASHBOARD, "view_path": args["view_path"], "card": args["card"]})
+                            result = content({"valid": True, "saved": False, "dashboard": dashboard_id, "view_path": args["view_path"], "card": args["card"]})
                         else:
                             async with state["lock"]:
                                 if state["pending"] is not None and time.monotonic() <= state["pending"]["expires"]:
                                     raise ValueError("Another proposal is awaiting approval")
-                                if hass.states.get(BUTTON) is None:
+                                if hass.states.get(approval_button) is None:
                                     raise ValueError("Approval button helper not found")
                                 pid = secrets.token_hex(8)
                                 state["pending"] = {"id": pid, "view_path": args["view_path"], "card": copy.deepcopy(args["card"]), "base_hash": digest(config), "expires": time.monotonic() + TTL}
                                 state["results"][pid] = {"status": "pending", "saved": False}
-                            await hass.services.async_call("persistent_notification", "create", {"title": "SmartHomeKI – Freigabe erforderlich", "message": f"Vorschlag {pid}: Karte '{args['card']['type']}' auf Seite '{args['view_path']}'. Nur wenn du diese Änderung möchtest, drücke innerhalb von 2 Minuten den Helfer-Taster '{BUTTON}'."}, blocking=False)
-                            result = content({"proposal_id": pid, "status": "pending", "saved": False, "expires_in_seconds": TTL, "approval_button": BUTTON, "view_path": args["view_path"], "card": args["card"]})
+                            await hass.services.async_call("persistent_notification", "create", {"title": "SmartHomeKI – Freigabe erforderlich", "message": f"Vorschlag {pid}: Karte '{args['card']['type']}' auf Seite '{args['view_path']}'. Nur wenn du diese Änderung möchtest, drücke innerhalb von 2 Minuten den Helfer-Taster '{approval_button}'."}, blocking=False)
+                            result = content({"proposal_id": pid, "status": "pending", "saved": False, "expires_in_seconds": TTL, "approval_button": approval_button, "view_path": args["view_path"], "card": args["card"]})
                     except (ValueError, TypeError) as exc:
                         result = content(str(exc), True)
             elif name in (EDIT_PREVIEW, EDIT_PROPOSE):
-                err = validate_edit_args(args)
+                err = validate_edit_args(args, dashboard_id, state["calendar_views"])
                 if err:
                     result = content(err, True)
                 else:
@@ -600,7 +629,7 @@ class MCPView(HomeAssistantView):
                             async with state["lock"]:
                                 if state["pending"] is not None and time.monotonic() <= state["pending"]["expires"]:
                                     raise ValueError("Another proposal is awaiting approval")
-                                if hass.states.get(BUTTON) is None:
+                                if hass.states.get(approval_button) is None:
                                     raise ValueError("Approval button helper not found")
                                 pid = secrets.token_hex(8)
                                 state["pending"] = {"id": pid, "kind": "edit_calendar_card", "view_path": args["view_path"],
@@ -610,14 +639,14 @@ class MCPView(HomeAssistantView):
                                 state["results"][pid] = {"status": "pending", "saved": False}
                             await hass.services.async_call("persistent_notification", "create", {
                                 "title": "SmartHomeKI – Kalenderkarte bearbeiten",
-                                "message": f"Vorschlag {pid}: Kalenderkarte auf '{args['view_path']}' ersetzen. Nur wenn gewünscht innerhalb von 2 Minuten '{BUTTON}' drücken."
+                                "message": f"Vorschlag {pid}: Kalenderkarte auf '{args['view_path']}' ersetzen. Nur wenn gewünscht innerhalb von 2 Minuten '{approval_button}' drücken."
                             }, blocking=False)
                             result = content({"proposal_id": pid, "status": "pending", "saved": False,
-                                              "expires_in_seconds": TTL, "approval_button": BUTTON})
+                                              "expires_in_seconds": TTL, "approval_button": approval_button})
                     except (ValueError, TypeError) as exc:
                         result = content(str(exc), True)
             elif name in (VIEW_PREVIEW, VIEW_PROPOSE):
-                err = validate_view_args(args)
+                err = validate_view_args(args, dashboard_id)
                 if err:
                     result = content(err, True)
                 else:
@@ -637,7 +666,7 @@ class MCPView(HomeAssistantView):
                             async with state["lock"]:
                                 if state["pending"] is not None and time.monotonic() <= state["pending"]["expires"]:
                                     raise ValueError("Another proposal is awaiting approval")
-                                if hass.states.get(BUTTON) is None:
+                                if hass.states.get(approval_button) is None:
                                     raise ValueError("Approval button helper not found")
                                 pid = secrets.token_hex(8)
                                 state["pending"] = {"id": pid, "kind": "replace_view", "view_path": args["view_path"],
@@ -646,10 +675,10 @@ class MCPView(HomeAssistantView):
                                 state["results"][pid] = {"status": "pending", "saved": False}
                             await hass.services.async_call("persistent_notification", "create", {
                                 "title": "SmartHomeKI – Ansicht ersetzen",
-                                "message": f"Vorschlag {pid}: {summary}. Bestehende Karten werden ersetzt. Nur wenn gewünscht innerhalb von 2 Minuten '{BUTTON}' drücken."
+                                "message": f"Vorschlag {pid}: {summary}. Bestehende Karten werden ersetzt. Nur wenn gewünscht innerhalb von 2 Minuten '{approval_button}' drücken."
                             }, blocking=False)
                             result = content({"proposal_id": pid, "status": "pending", "saved": False,
-                                              "expires_in_seconds": TTL, "approval_button": BUTTON, "summary": summary})
+                                              "expires_in_seconds": TTL, "approval_button": approval_button, "summary": summary})
                     except (ValueError, TypeError) as exc:
                         result = content(str(exc), True)
             elif name == SIDEBAR:
@@ -663,16 +692,16 @@ class MCPView(HomeAssistantView):
                     async with state["lock"]:
                         if state["pending"] is not None and time.monotonic() <= state["pending"]["expires"]:
                             raise ValueError("Another proposal is awaiting approval")
-                        if hass.states.get(BUTTON) is None:
+                        if hass.states.get(approval_button) is None:
                             raise ValueError("Approval button helper not found")
                         pid = secrets.token_hex(8)
                         state["pending"] = {"id": pid, "kind": "sidebar_visible", "base_hash": digest(config), "expires": time.monotonic() + TTL}
                         state["results"][pid] = {"status": "pending", "saved": False}
                     await hass.services.async_call("persistent_notification", "create", {
                         "title": "SmartHomeKI – Seitenleiste freigeben",
-                        "message": f"Vorschlag {pid}: kiosk_mode.hide_sidebar wird auf false gesetzt (auch auf Tablets sichtbar). Nur wenn gewünscht, drücke innerhalb von 2 Minuten '{BUTTON}'."
+                        "message": f"Vorschlag {pid}: kiosk_mode.hide_sidebar wird auf false gesetzt (auch auf Tablets sichtbar). Nur wenn gewünscht, drücke innerhalb von 2 Minuten '{approval_button}'."
                     }, blocking=False)
-                    result = content({"proposal_id": pid, "status": "pending", "saved": False, "expires_in_seconds": TTL, "approval_button": BUTTON, "change": "kiosk_mode.hide_sidebar = false"})
+                    result = content({"proposal_id": pid, "status": "pending", "saved": False, "expires_in_seconds": TTL, "approval_button": approval_button, "change": "kiosk_mode.hide_sidebar = false"})
                 except ValueError as exc:
                     result = content(str(exc), True)
             elif name == STATUS:

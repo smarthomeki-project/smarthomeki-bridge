@@ -1,8 +1,8 @@
 {
   "domain": "smarthomeki_bridge",
   "name": "SmartHomeKI Bridge (approval-gated MCP)",
-  "version": "2.1.0",
-  "documentation": "https://www.home-assistant.io/integrations/marketplace/",
+  "version": "2.1.1",
+  "documentation": "https://github.com/smarthomeki-project/smarthomeki-bridge",
   "dependencies": [
     "http",
     "lovelace",
